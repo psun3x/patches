@@ -1,0 +1,45 @@
+From f76945e525b58fccd46a970119e634e045c4bbeb Mon Sep 17 00:00:00 2001
+From: Peng Sun <peng.p.sun@intel.com>
+Date: Thu, 4 Feb 2021 14:20:33 +0800
+Subject: [PATCH] Temp: Enable iommu logs.
+
+Signed-off-by: Peng Sun <peng.p.sun@intel.com>
+---
+ hypervisor/arch/x86/vtd.c | 8 ++++----
+ 1 file changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/hypervisor/arch/x86/vtd.c b/hypervisor/arch/x86/vtd.c
+index 39fd98ce4..6381f6a61 100644
+--- a/hypervisor/arch/x86/vtd.c
++++ b/hypervisor/arch/x86/vtd.c
+@@ -24,13 +24,13 @@
+ #include <pci.h>
+ #include <platform_caps.h>
+ 
+-#define DBG_IOMMU 0
++#define DBG_IOMMU 1
+ 
+ #if DBG_IOMMU
+ #define DBG_LEVEL_IOMMU LOG_INFO
+ #define DMAR_FAULT_LOOP_MAX 10
+ #else
+-#define DBG_LEVEL_IOMMU 6U
++#define DBG_LEVEL_IOMMU 2U
+ #endif
+ #define LEVEL_WIDTH 9U
+ 
+@@ -809,9 +809,9 @@ static void fault_record_analysis(__unused uint64_t low, uint64_t high)
+ 			(dma_frcd_up_t(high) != 0U) ? "Read/Atomic" : "Write", dma_frcd_up_fr(high),
+ 			dmar_bdf.bits.b, dmar_bdf.bits.d, dmar_bdf.bits.f, low);
+ #if DBG_IOMMU
+-		if (iommu_ecap_dt(dmar_unit->ecap) != 0U) {
++		//if (iommu_ecap_dt(dmar_unit->ecap) != 0U) {
+ 			pr_info("Address Type: 0x%x", dma_frcd_up_at(high));
+-		}
++		//}
+ #endif
+ 	}
+ }
+-- 
+2.25.1
+
