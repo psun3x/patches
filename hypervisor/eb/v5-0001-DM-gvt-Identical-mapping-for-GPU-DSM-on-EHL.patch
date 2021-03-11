@@ -1,0 +1,66 @@
+From 1264e5fd250c48c15d5a974006e23ca124de9401 Mon Sep 17 00:00:00 2001
+From: Peng Sun <peng.p.sun@intel.com>
+Date: Wed, 10 Mar 2021 14:13:02 +0800
+Subject: [PATCH v5] DM: gvt: Identical mapping for GPU DSM on EHL
+
+    Windows graphic driver obtains DSM address from in-BAR mmio register
+    which has passthroughed. Not like the other platforms obtained from
+    pci configure space register which has virtualized. So EHL has to
+    keep identical mapping to avoid trap mmio BAR to do the emulation.
+
+    To keep simple, this patch hardcode the EHL DSM region in vE820
+    table, this will cause memory waste here. In the near future, we
+    need refine the entire vE820 logic as it is hard to maintained
+    due to many reserved regions have introduced in recently.
+
+Signed-off-by: Peng Sun <peng.p.sun@intel.com>
+---
+ devicemodel/core/sw_load_common.c |  2 +-
+ devicemodel/hw/pci/passthrough.c  | 18 ------------------
+ 2 files changed, 1 insertion(+), 19 deletions(-)
+
+diff --git a/devicemodel/core/sw_load_common.c b/devicemodel/core/sw_load_common.c
+index b6bdd39d4..8b834c59a 100644
+--- a/devicemodel/core/sw_load_common.c
++++ b/devicemodel/core/sw_load_common.c
+@@ -65,7 +65,7 @@ static char bootargs[BOOT_ARG_LEN];
+  * FIXME: Do we need to reserve DSM and OPREGION for GVTD here.
+  */
+ 
+-#define GPU_DSM_OPREGION_BASE_GPA 0x3B800000
++#define GPU_DSM_OPREGION_BASE_GPA 0x6c000000
+ #define GPU_DSM_OPREGION_SIZE  0x4004000
+ 
+ const struct e820_entry e820_default_entries[NUM_E820_ENTRIES] = {
+diff --git a/devicemodel/hw/pci/passthrough.c b/devicemodel/hw/pci/passthrough.c
+index 61701ce63..70e3f8a11 100644
+--- a/devicemodel/hw/pci/passthrough.c
++++ b/devicemodel/hw/pci/passthrough.c
+@@ -487,24 +487,6 @@ passthru_gpu_dsm_opregion(struct vmctx *ctx, struct passthru_dev *ptdev,
+ 
+ 	switch (device) {
+ 	case INTEL_ELKHARTLAKE:
+-		/* BDSM register has 64 bits.
+-		 * bits 63:20 contains the base address of stolen memory
+-		 */
+-		gpu_dsm_hpa = read_config(ptdev->phys_dev, PCIR_GEN11_BDSM_DW0, 4);
+-		dsm_mask_val = gpu_dsm_hpa & ~PCIM_BDSM_MASK;
+-		gpu_dsm_hpa &= PCIM_BDSM_MASK;
+-		gpu_dsm_hpa |= (uint64_t)read_config(ptdev->phys_dev, PCIR_GEN11_BDSM_DW1, 4) << 32;
+-		gpu_dsm_gpa = GPU_DSM_GPA;
+-
+-		pci_set_cfgdata32(ptdev->dev, PCIR_GEN11_BDSM_DW0, gpu_dsm_gpa | dsm_mask_val);
+-		/* write 0 to high 32-bits of BDSM on EHL platform */
+-		pci_set_cfgdata32(ptdev->dev, PCIR_GEN11_BDSM_DW1, 0);
+-
+-		gpu_opregion_gpa = GPU_OPREGION_GPA;
+-
+-		ptdev->has_virt_pcicfg_regs = &has_virt_pcicfg_regs_on_ehl_gpu;
+-		break;
+-
+ 	case INTEL_TIGERLAKE:
+ 		/* BDSM register has 64 bits.
+ 		 * bits 63:20 contains the base address of stolen memory
+-- 
+2.25.1
+
