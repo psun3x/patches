@@ -1,0 +1,160 @@
+From 7c530d99ec19c0dd9a22c75ac78dd56e73cc4841 Mon Sep 17 00:00:00 2001
+From: Peng Sun <peng.p.sun@intel.com>
+Date: Wed, 10 Mar 2021 14:13:02 +0800
+Subject: [PATCH v1] DM: gvt: Identical mapping for GPU DSM and GSM on EHL SBL
+
+    Windows graphic driver obtains DSM and GSM address from in-BAR mmio
+    register which has passthroughed. Not like the other platforms
+    obtained from pci configure space register which has virtualized.
+    So EHL has to keep identical mapping to avoid trap mmio BAR to do
+    the emulation.
+
+    To keep simple, this patch hardcode the EHL DSM region in vE820
+    table, this will cause memory waste here. In the near future, we
+    need refine the entire vE820 logic as it is hard to maintained
+    due to many reserved regions have introduced in recently.
+
+Also modify the e820 layout to fit the DSM region.
+
+Signed-off-by: Peng Sun <peng.p.sun@intel.com>
+---
+ devicemodel/core/sw_load_common.c | 25 +++++++++++++------------
+ devicemodel/hw/pci/passthrough.c  | 24 +++---------------------
+ devicemodel/include/pci_core.h    |  2 +-
+ devicemodel/include/pcireg.h      |  2 +-
+ 4 files changed, 18 insertions(+), 35 deletions(-)
+
+diff --git a/devicemodel/core/sw_load_common.c b/devicemodel/core/sw_load_common.c
+index b6bdd39d4..43fd489d9 100644
+--- a/devicemodel/core/sw_load_common.c
++++ b/devicemodel/core/sw_load_common.c
+@@ -65,8 +65,8 @@ static char bootargs[BOOT_ARG_LEN];
+  * FIXME: Do we need to reserve DSM and OPREGION for GVTD here.
+  */
+ 
+-#define GPU_DSM_OPREGION_BASE_GPA 0x3B800000
+-#define GPU_DSM_OPREGION_SIZE  0x4004000
++#define GPU_GSM_DSM_OPREGION_BASE_GPA 0x7b800000
++#define GPU_GSM_DSM_OPREGION_SIZE  0x4404000
+ 
+ const struct e820_entry e820_default_entries[NUM_E820_ENTRIES] = {
+ 	{	/* 0 to video memory */
+@@ -81,29 +81,30 @@ const struct e820_entry e820_default_entries[NUM_E820_ENTRIES] = {
+ 		.type     = E820_TYPE_RAM
+ 	},
+ 
+-	{	/* TGL GPU DSM & OpRegion area */
+-		.baseaddr = GPU_DSM_OPREGION_BASE_GPA,
+-		.length   = GPU_DSM_OPREGION_SIZE,
+-		.type     = E820_TYPE_RESERVED
++	{
++		.baseaddr = SOFTWARE_SRAM_BASE_GPA, /* 0x78000000 */
++		.length   = SOFTWARE_SRAM_MAX_SIZE,
++		.type	  = E820_TYPE_RESERVED
+ 	},
+ 
+ 	{	/* lowmem part2 to lowmem_limit */
+-		.baseaddr = GPU_DSM_OPREGION_BASE_GPA + GPU_DSM_OPREGION_SIZE,
++		.baseaddr = SOFTWARE_SRAM_BASE_GPA + SOFTWARE_SRAM_MAX_SIZE,
+ 		.length   = 0x0,
+ 		.type     = E820_TYPE_RESERVED
+ 	},
+ 
++	{	/* TGL GPU DSM & OpRegion area */
++		.baseaddr = GPU_GSM_DSM_OPREGION_BASE_GPA,
++		.length   = GPU_GSM_DSM_OPREGION_SIZE,
++		.type     = E820_TYPE_RESERVED
++	},
++
+ 	/*
+ 	 * Software SRAM area: base: 0x7f800000, size: 0x800000
+ 	 * In native, the Software SRAM region should be part of DRAM memory.
+ 	 * But one fixed Software SRAM gpa is friendly for virtualization due
+ 	 * to decoupled with various guest memory size.
+ 	 */
+-	{
+-		.baseaddr = SOFTWARE_SRAM_BASE_GPA,
+-		.length   = SOFTWARE_SRAM_MAX_SIZE,
+-		.type	  = E820_TYPE_RESERVED
+-	},
+ 
+ 	{	/* ECFG_BASE to 4GB */
+ 		.baseaddr = PCI_EMUL_ECFG_BASE,
+diff --git a/devicemodel/hw/pci/passthrough.c b/devicemodel/hw/pci/passthrough.c
+index 61701ce63..2d6ae1025 100644
+--- a/devicemodel/hw/pci/passthrough.c
++++ b/devicemodel/hw/pci/passthrough.c
+@@ -487,24 +487,6 @@ passthru_gpu_dsm_opregion(struct vmctx *ctx, struct passthru_dev *ptdev,
+ 
+ 	switch (device) {
+ 	case INTEL_ELKHARTLAKE:
+-		/* BDSM register has 64 bits.
+-		 * bits 63:20 contains the base address of stolen memory
+-		 */
+-		gpu_dsm_hpa = read_config(ptdev->phys_dev, PCIR_GEN11_BDSM_DW0, 4);
+-		dsm_mask_val = gpu_dsm_hpa & ~PCIM_BDSM_MASK;
+-		gpu_dsm_hpa &= PCIM_BDSM_MASK;
+-		gpu_dsm_hpa |= (uint64_t)read_config(ptdev->phys_dev, PCIR_GEN11_BDSM_DW1, 4) << 32;
+-		gpu_dsm_gpa = GPU_DSM_GPA;
+-
+-		pci_set_cfgdata32(ptdev->dev, PCIR_GEN11_BDSM_DW0, gpu_dsm_gpa | dsm_mask_val);
+-		/* write 0 to high 32-bits of BDSM on EHL platform */
+-		pci_set_cfgdata32(ptdev->dev, PCIR_GEN11_BDSM_DW1, 0);
+-
+-		gpu_opregion_gpa = GPU_OPREGION_GPA;
+-
+-		ptdev->has_virt_pcicfg_regs = &has_virt_pcicfg_regs_on_ehl_gpu;
+-		break;
+-
+ 	case INTEL_TIGERLAKE:
+ 		/* BDSM register has 64 bits.
+ 		 * bits 63:20 contains the base address of stolen memory
+@@ -523,7 +505,7 @@ passthru_gpu_dsm_opregion(struct vmctx *ctx, struct passthru_dev *ptdev,
+ 		/* write 0 to high 32-bits of BDSM on EHL platform */
+ 		pci_set_cfgdata32(ptdev->dev, PCIR_GEN11_BDSM_DW1, 0);
+ 
+-		gpu_opregion_gpa = gpu_dsm_gpa + GPU_DSM_SIZE;
++		gpu_opregion_gpa = gpu_dsm_gpa - 1 * MB;
+ 
+ 		ptdev->has_virt_pcicfg_regs = &has_virt_pcicfg_regs_on_ehl_gpu;
+ 		break;
+@@ -546,8 +528,8 @@ passthru_gpu_dsm_opregion(struct vmctx *ctx, struct passthru_dev *ptdev,
+ 	pci_set_cfgdata32(ptdev->dev, PCIR_ASLS_CTL, gpu_opregion_gpa | (opregion_phys & ~PCIM_ASLS_OPREGION_MASK));
+ 
+ 	/* initialize the EPT mapping for passthrough GPU dsm region */
+-	vm_unmap_ptdev_mmio(ctx, 0, 2, 0, gpu_dsm_gpa, GPU_DSM_SIZE, gpu_dsm_hpa);
+-	vm_map_ptdev_mmio(ctx, 0, 2, 0, gpu_dsm_gpa, GPU_DSM_SIZE, gpu_dsm_hpa);
++	vm_unmap_ptdev_mmio(ctx, 0, 2, 0, (gpu_dsm_gpa - 8*MB), (GPU_DSM_SIZE + 8*MB), (gpu_dsm_hpa - 8*MB));
++	vm_map_ptdev_mmio(ctx, 0, 2, 0, (gpu_dsm_gpa - 8*MB), (GPU_DSM_SIZE + 8*MB), (gpu_dsm_hpa - 8*MB));
+ 
+ 	/* initialize the EPT mapping for passthrough GPU opregion */
+ 	vm_unmap_ptdev_mmio(ctx, 0, 2, 0, gpu_opregion_gpa, GPU_OPREGION_SIZE, gpu_opregion_hpa);
+diff --git a/devicemodel/include/pci_core.h b/devicemodel/include/pci_core.h
+index b6ffb98ca..31595b0c1 100644
+--- a/devicemodel/include/pci_core.h
++++ b/devicemodel/include/pci_core.h
+@@ -49,7 +49,7 @@
+ #define	PCI_EMUL_MEMLIMIT64	0x140000000UL	/* 5GB */
+ 
+ #define SOFTWARE_SRAM_MAX_SIZE	0x00800000UL
+-#define SOFTWARE_SRAM_BASE_GPA	(PCI_EMUL_MEMBASE32 - SOFTWARE_SRAM_MAX_SIZE)
++#define SOFTWARE_SRAM_BASE_GPA	(PCI_EMUL_MEMBASE32 - 128 * MB)
+ 
+ /* Currently,only gvt need reserved bar regions,
+  * so just hardcode REGION_NUMS=5 here
+diff --git a/devicemodel/include/pcireg.h b/devicemodel/include/pcireg.h
+index a9c90f573..0934476be 100644
+--- a/devicemodel/include/pcireg.h
++++ b/devicemodel/include/pcireg.h
+@@ -1066,7 +1066,7 @@
+ #define	PCIM_OSC_CTL_PCIE_CAP_STRUCT	0x10 /* Various Capability Structures */
+ 
+ /* Graphics definitions */
+-#define INTEL_ELKHARTLAKE		0x4551
++#define INTEL_ELKHARTLAKE		0x4571
+ #define INTEL_TIGERLAKE		0x9a49
+ #define PCIR_BDSM			0x5C /* BDSM graphics base data of stolen memory register */
+ #define PCIR_GEN11_BDSM_DW0		0xC0
+-- 
+2.25.1
+
