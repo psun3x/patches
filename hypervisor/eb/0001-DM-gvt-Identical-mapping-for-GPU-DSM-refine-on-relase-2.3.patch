@@ -1,0 +1,405 @@
+From 391f7494cda17ae9d8d27d24c525f81e21388b46 Mon Sep 17 00:00:00 2001
+From: Peng Sun <peng.p.sun@intel.com>
+Date: Mon, 10 May 2021 18:32:48 +0800
+Subject: [PATCH] DM: gvt: Identical mapping for GPU DSM refine to support
+ EHL/TGL
+
+Windows graphic driver obtains DSM address from in-BAR mmio register
+which has passthroughed. Not like the other platforms obtained from
+pci configure space register which has virtualized. GPU GuC must use
+WOPCM in DSM, besides, Windows OS wants to manage DSM also. These two
+reason force acrn has to keep identical mapping to avoid trap mmio
+BAR to do the emulation.
+
+Tracked-On: #5880
+Signed-off-by: Peng Sun <peng.p.sun@intel.com>
+---
+ devicemodel/core/sw_load_common.c   | 93 +++++++++++++++++++----------
+ devicemodel/hw/pci/passthrough.c    | 70 ++++------------------
+ devicemodel/hw/platform/acpi/acpi.c | 23 ++++++-
+ devicemodel/include/pci_core.h      | 39 ++++++++++++
+ devicemodel/include/pcireg.h        |  4 +-
+ devicemodel/include/sw_load.h       |  2 +-
+ 6 files changed, 139 insertions(+), 92 deletions(-)
+
+diff --git a/devicemodel/core/sw_load_common.c b/devicemodel/core/sw_load_common.c
+index b33c3a284..e694105cd 100644
+--- a/devicemodel/core/sw_load_common.c
++++ b/devicemodel/core/sw_load_common.c
+@@ -54,13 +54,11 @@ static char bootargs[BOOT_ARG_LEN];
+  *             Begin    Limit        Type            Length
+  * 0:              0 -  0xA0000      RAM             0xA0000
+  * 1:       0x100000 -  lowmem part1 RAM             0x0
+- * 2:   gpu_rsvd_bot -  gpu_rsvd_top (reserved)      0x4004000
+- * 3:   pSRAM_bottom -  pSRAM_top    (reserved)      pSRAM_MAX_SIZE
++ * 2:   SW SRAM_bot  -  SW SRAM_top  (reserved)      SOFTWARE_SRAM_MAX_SIZE
++ * 3:   gpu_rsvd_bot -  gpu_rsvd_top (reserved)      0x4004000
+  * 4:   lowmem part2 -  0x80000000   (reserved)      0x0
+- * 5:     0xDB000000 -  0xDF000000   (reserved)      64MB
+- * 6:     0xDF000000 -  0xE0000000   (reserved)      16MB
+- * 7:     0xE0000000 -  0x100000000  MCFG, MMIO      512MB
+- * 8:    0x140000000 -  highmem      RAM             highmem - 5GB
++ * 5:     0xE0000000 -  0x100000000  MCFG, MMIO      512MB
++ * 6:    0x140000000 -  highmem      RAM             highmem - 5GB
+  *
+  * FIXME: Do we need to reserve DSM and OPREGION for GVTD here.
+  */
+@@ -77,20 +75,20 @@ const struct e820_entry e820_default_entries[NUM_E820_ENTRIES] = {
+ 		.type     = E820_TYPE_RAM
+ 	},
+ 
+-	{	/* TGL GPU DSM & OpRegion area */
+-		.baseaddr = 0x3B800000,
+-		.length   = 0x4004000,
++	{	/* pSRAM area */
++		.baseaddr = 0x0,
++		.length   = 0x0,
+ 		.type     = E820_TYPE_RESERVED
+ 	},
+ 
+-	{	/* pSRAM area */
+-		.baseaddr = PSRAM_BASE_GPA,
+-		.length   = PSRAM_MAX_SIZE,
++	{       /* GPU DSM & OpRegion reserved region */
++		.baseaddr = 0x0,
++		.length   = 0x0,
+ 		.type     = E820_TYPE_RESERVED
+ 	},
+ 
+ 	{	/* lowmem part2 to lowmem_limit */
+-		.baseaddr = PSRAM_BASE_GPA + PSRAM_MAX_SIZE,
++		.baseaddr = 0x0,
+ 		.length   = 0x0,
+ 		.type     = E820_TYPE_RESERVED
+ 	},
+@@ -215,31 +213,64 @@ uint32_t
+ acrn_create_e820_table(struct vmctx *ctx, struct e820_entry *e820)
+ {
+ 	uint32_t removed = 0, k;
++	uint32_t gpu_rsvmem_base_gpa = 0;
++	uint64_t software_sram_base_gpa = 0;
+ 
+ 	memcpy(e820, e820_default_entries, sizeof(e820_default_entries));
+-	if (ctx->lowmem <= e820[LOWRAM_E820_ENTRY+3].baseaddr) {
+-		e820[LOWRAM_E820_ENTRY].length =
+-			(ctx->lowmem < e820[LOWRAM_E820_ENTRY+1].baseaddr ? ctx->lowmem :
+-			e820[LOWRAM_E820_ENTRY+1].baseaddr) - e820[LOWRAM_E820_ENTRY].baseaddr;
++	/* FIXME: Here wastes 8MB memory if pSRAM is enabled, and 64MB+16KB if
++	 * GPU reserved memory is exist.
++	 *
++	 * Determines the GPU region due to DSM identical mapping.
++	 */
++	gpu_rsvmem_base_gpa = get_gpu_rsvmem_base_gpa();
++	if (gpu_rsvmem_base_gpa) {
++		e820[LOWRAM_E820_ENTRY + 2].baseaddr = gpu_rsvmem_base_gpa;
++		e820[LOWRAM_E820_ENTRY + 2].length = get_gpu_rsvmem_size();
++	} else {
++		e820[LOWRAM_E820_ENTRY + 2].baseaddr = ctx->lowmem_limit;
++	}
+ 
+-		memmove(&e820[LOWRAM_E820_ENTRY+3], &e820[LOWRAM_E820_ENTRY+4],
+-				sizeof(struct e820_entry) *
+-				(NUM_E820_ENTRIES - (LOWRAM_E820_ENTRY+4)));
+-		removed++;
++	/* Always put SW SRAM before GPU region and keep 1MB boundary for protection. */
++	software_sram_base_gpa = get_software_sram_base_gpa();
++	if (software_sram_base_gpa) {
++		e820[LOWRAM_E820_ENTRY + 1].baseaddr = software_sram_base_gpa;
++		e820[LOWRAM_E820_ENTRY + 1].length = get_software_sram_size();
+ 	} else {
+-		e820[LOWRAM_E820_ENTRY].length = e820[LOWRAM_E820_ENTRY+1].baseaddr -
+-			e820[LOWRAM_E820_ENTRY].baseaddr;
+-		e820[LOWRAM_E820_ENTRY+3].length =
+-			(ctx->lowmem < ctx->lowmem_limit ? ctx->lowmem : ctx->lowmem_limit) -
+-			e820[LOWRAM_E820_ENTRY+3].baseaddr;
++		e820[LOWRAM_E820_ENTRY + 1].baseaddr = e820[LOWRAM_E820_ENTRY + 2].baseaddr;
+ 	}
+ 
+-	/* remove [5GB, highmem) if it's empty */
+-	if (ctx->highmem > 0) {
+-		e820[HIGHRAM_E820_ENTRY - removed].type = E820_TYPE_RAM;
+-		e820[HIGHRAM_E820_ENTRY - removed].length = ctx->highmem;
++	if (ctx->lowmem <= e820[LOWRAM_E820_ENTRY + 1].baseaddr) {
++		/* Caculation for lowmem part1 */
++		e820[LOWRAM_E820_ENTRY].length =
++			ctx->lowmem - e820[LOWRAM_E820_ENTRY].baseaddr;
+ 	} else {
+-		removed++;
++		/* Caculation for lowmem part1 */
++		e820[LOWRAM_E820_ENTRY].length =
++			e820[LOWRAM_E820_ENTRY + 1].baseaddr - e820[LOWRAM_E820_ENTRY].baseaddr;
++		/* Caculation for lowmem part2 */
++		e820[LOWRAM_E820_ENTRY + 3].baseaddr =
++			e820[LOWRAM_E820_ENTRY + 2].baseaddr + e820[LOWRAM_E820_ENTRY + 2].length;
++			if (ctx->lowmem > e820[LOWRAM_E820_ENTRY + 3].baseaddr) {
++				e820[LOWRAM_E820_ENTRY + 3].length =
++					ctx->lowmem - e820[LOWRAM_E820_ENTRY + 3].baseaddr;
++				e820[LOWRAM_E820_ENTRY + 3].type = E820_TYPE_RAM;
++			}
++	}
++
++	/* Caculation for highmem */
++	if (ctx->highmem > 0) {
++		e820[HIGHRAM_E820_ENTRY].type = E820_TYPE_RAM;
++		e820[HIGHRAM_E820_ENTRY].length = ctx->highmem;
++	}
++
++	/* Remove empty entries in e820 table */
++	for (k = 0; k < (NUM_E820_ENTRIES - 1 - removed); k++) {
++		if (e820[k].length == 0x0) {
++			memmove(&e820[k], &e820[k + 1], sizeof(struct e820_entry) *
++					(NUM_E820_ENTRIES - (k + 1)));
++			k--;
++			removed++;
++		}
+ 	}
+ 
+ 	pr_info("SW_LOAD: build e820 %d entries to addr: %p\r\n",
+diff --git a/devicemodel/hw/pci/passthrough.c b/devicemodel/hw/pci/passthrough.c
+index 61701ce63..5fa164a44 100644
+--- a/devicemodel/hw/pci/passthrough.c
++++ b/devicemodel/hw/pci/passthrough.c
+@@ -59,41 +59,6 @@
+ 
+ #define PCI_BDF_GPU			0x00000010	/* 00:02.0 */
+ 
+-/* Reserved region in e820 table for GVT
+- * for GVT-g use:
+- * [0xDF000000, 0xDF800000) 8M, GOP FB, used OvmfPkg/GvtGopDxe for 1080p@30
+- * [0xDFFFD000, 0xDFFFF000) 8K, OpRegion, used by GvtGopDxe and GVT-g
+- * [0xDFFFF000, 0XE0000000) 4K, Reserved, not used
+- * for TGL GVT-d use:
+- * [0x3B800000, 0x3F800000) 64M, Date Stolen Memory
+- * [0x3F800000, 0X3F804000] 16K, OpRegion and Extended OpRegion
+- * for EHL/WHL/KBL GVT-d use:
+- * [0xDB000000, 0xDF000000) 64M, DSM, used by native GOP and gfx driver
+- * [0xDFFFC000, 0xDFFFE000) 8K, OpRegion, used by native GOP and gfx driver
+- * [0xDFFFE000, 0XE0000000] 8K, Extended OpRegion, store raw VBT
+- * OpRegion: 8KB(0x2000)
+- * [ OpRegion Header      ] Offset: 0x0
+- * [ Mailbox #1: ACPI     ] Offset: 0x100
+- * [ Mailbox #2: SWSCI    ] Offset: 0x200
+- * [ Mailbox #3: ASLE     ] Offset: 0x300
+- * [ Mailbox #4: VBT      ] Offset: 0x400
+- * [ Mailbox #5: ASLE EXT ] Offset: 0x1C00
+- * Extended OpRegion: 8KB(0x2000)
+- * [ Raw VBT              ] Offset: 0x0
+- * If VBT <= 6KB, stores in Mailbox #4
+- * If VBT > 6KB, stores in Extended OpRegion
+- * ASLE.rvda stores the location of VBT.
+- * For OpRegion 2.1+: ASLE.rvda = offset to OpRegion base address
+- * For OpRegion 2.0:  ASLE.rvda = physical address, not support currently
+- */
+-#define GPU_DSM_GPA				0xDB000000
+-#define GPU_DSM_SIZE			0x4000000
+-#define GPU_OPREGION_GPA		0xDFFFC000
+-#define GPU_OPREGION_SIZE		0x4000
+-/*
+- * TODO: Forced DSM/OPREGION size requires native BIOS configuration.
+- * This limitation need remove in future
+- */
+ uint32_t gpu_dsm_hpa = 0;
+ uint32_t gpu_dsm_gpa = 0;
+ uint32_t gpu_opregion_hpa = 0;
+@@ -472,6 +437,18 @@ has_virt_pcicfg_regs_on_def_gpu(int offset)
+ 	return ((offset == PCIR_BDSM) || (offset == PCIR_ASLS_CTL));
+ }
+ 
++uint32_t
++get_gpu_rsvmem_base_gpa()
++{
++	return gpu_opregion_gpa;
++}
++
++uint32_t
++get_gpu_rsvmem_size()
++{
++	return GPU_OPREGION_SIZE + GPU_DSM_SIZE;
++}
++
+ /*
+  * passthrough GPU DSM(Data Stolen Memory) and Opregion to guest
+  */
+@@ -487,24 +464,6 @@ passthru_gpu_dsm_opregion(struct vmctx *ctx, struct passthru_dev *ptdev,
+ 
+ 	switch (device) {
+ 	case INTEL_ELKHARTLAKE:
+-		/* BDSM register has 64 bits.
+-		 * bits 63:20 contains the base address of stolen memory
+-		 */
+-		gpu_dsm_hpa = read_config(ptdev->phys_dev, PCIR_GEN11_BDSM_DW0, 4);
+-		dsm_mask_val = gpu_dsm_hpa & ~PCIM_BDSM_MASK;
+-		gpu_dsm_hpa &= PCIM_BDSM_MASK;
+-		gpu_dsm_hpa |= (uint64_t)read_config(ptdev->phys_dev, PCIR_GEN11_BDSM_DW1, 4) << 32;
+-		gpu_dsm_gpa = GPU_DSM_GPA;
+-
+-		pci_set_cfgdata32(ptdev->dev, PCIR_GEN11_BDSM_DW0, gpu_dsm_gpa | dsm_mask_val);
+-		/* write 0 to high 32-bits of BDSM on EHL platform */
+-		pci_set_cfgdata32(ptdev->dev, PCIR_GEN11_BDSM_DW1, 0);
+-
+-		gpu_opregion_gpa = GPU_OPREGION_GPA;
+-
+-		ptdev->has_virt_pcicfg_regs = &has_virt_pcicfg_regs_on_ehl_gpu;
+-		break;
+-
+ 	case INTEL_TIGERLAKE:
+ 		/* BDSM register has 64 bits.
+ 		 * bits 63:20 contains the base address of stolen memory
+@@ -523,8 +482,6 @@ passthru_gpu_dsm_opregion(struct vmctx *ctx, struct passthru_dev *ptdev,
+ 		/* write 0 to high 32-bits of BDSM on EHL platform */
+ 		pci_set_cfgdata32(ptdev->dev, PCIR_GEN11_BDSM_DW1, 0);
+ 
+-		gpu_opregion_gpa = gpu_dsm_gpa + GPU_DSM_SIZE;
+-
+ 		ptdev->has_virt_pcicfg_regs = &has_virt_pcicfg_regs_on_ehl_gpu;
+ 		break;
+ 	/* If on default platforms, such as KBL,WHL  */
+@@ -537,12 +494,11 @@ passthru_gpu_dsm_opregion(struct vmctx *ctx, struct passthru_dev *ptdev,
+ 
+ 		pci_set_cfgdata32(ptdev->dev, PCIR_BDSM, gpu_dsm_gpa | dsm_mask_val);
+ 
+-		gpu_opregion_gpa = GPU_OPREGION_GPA;
+-
+ 		ptdev->has_virt_pcicfg_regs = &has_virt_pcicfg_regs_on_def_gpu;
+ 		break;
+ 	}
+ 
++	gpu_opregion_gpa = gpu_dsm_gpa - GPU_OPREGION_SIZE;
+ 	pci_set_cfgdata32(ptdev->dev, PCIR_ASLS_CTL, gpu_opregion_gpa | (opregion_phys & ~PCIM_ASLS_OPREGION_MASK));
+ 
+ 	/* initialize the EPT mapping for passthrough GPU dsm region */
+diff --git a/devicemodel/hw/platform/acpi/acpi.c b/devicemodel/hw/platform/acpi/acpi.c
+index 5d283e1f4..2c7f91ead 100644
+--- a/devicemodel/hw/platform/acpi/acpi.c
++++ b/devicemodel/hw/platform/acpi/acpi.c
+@@ -106,6 +106,9 @@ static int basl_verbose_iasl;
+ static int basl_ncpu;
+ static uint32_t basl_acpi_base = ACPI_BASE;
+ 
++static uint64_t software_sram_size;
++static uint64_t software_sram_base_gpa;
++
+ /*
+  * Contains the full pathname of the template to be passed
+  * to mkstemp/mktemps(3)
+@@ -1080,6 +1083,16 @@ static struct {
+ 	{ basl_fwrite_dsdt, DSDT_OFFSET, true  }
+ };
+ 
++uint64_t get_software_sram_base_gpa(void)
++{
++	return software_sram_base_gpa;
++}
++
++uint64_t get_software_sram_size(void)
++{
++	return software_sram_size;
++}
++
+ /*
+  * So far, only support passthrough native pSRAM to single post-launched VM.
+  */
+@@ -1094,13 +1107,21 @@ int create_and_inject_vptct(struct vmctx *ctx)
+ 	uint8_t buf[PTCT_BUF_LEN] = {0};
+ 	struct vm_memmap memmap = {
+ 		.type = VM_MMIO,
+-		.gpa = PSRAM_BASE_GPA,
+ 		.hpa = PSRAM_BASE_HPA,
+ 		/* TODO: .len should be psram_size+32kb (32kb is for PTCM binary). We also need to modify guest E820 to adapt to real config */
+ 		.len = PSRAM_MAX_SIZE,
+ 		.prot = PROT_ALL
+ 	};
++	uint32_t gpu_rsvmem_base_gpa = 0;
+ 
++	gpu_rsvmem_base_gpa = get_gpu_rsvmem_base_gpa();
++	software_sram_size = PSRAM_MAX_SIZE;
++	/* TODO: It is better to put one boundary between GPU region and SW SRAM
++	 * for protection.
++	 */
++	software_sram_base_gpa = ((gpu_rsvmem_base_gpa ? gpu_rsvmem_base_gpa : 0x80000000UL) -
++			software_sram_size) &  ~software_sram_size;
++	memmap.gpa = software_sram_base_gpa;
+ 	native_ptct_fd = open(PTCT_NATIVE_FILE_PATH_IN_SOS, O_RDONLY);
+ 	if (native_ptct_fd < 0){
+ 		pr_err("failed to open /sys/firmware/acpi/tables/PTCT !!!!! errno:%d\n", errno);
+diff --git a/devicemodel/include/pci_core.h b/devicemodel/include/pci_core.h
+index 7ce16d1c7..5a63e6320 100644
+--- a/devicemodel/include/pci_core.h
++++ b/devicemodel/include/pci_core.h
+@@ -260,6 +260,45 @@ int create_mmio_rsvd_rgn(uint64_t start,
+                 uint64_t end, int idx, int bar_type, struct pci_vdev *vdev);
+ void destory_mmio_rsvd_rgns(struct pci_vdev *vdev);
+ 
++/* Reserved region in e820 table for GVT
++ * for GVT-g use:
++ * [0xDF000000, 0xDF800000) 8M, GOP FB, used OvmfPkg/GvtGopDxe for 1080p@30
++ * [0xDFFFD000, 0xDFFFF000) 8K, OpRegion, used by GvtGopDxe and GVT-g
++ * [0xDFFFF000, 0XE0000000) 4K, Reserved, not used
++ * for TGL/EHL GVT-d use: identical mapping, same with host layout
++ * [gpu_opregion_hpa, gpu_opregion_hpa+size) 16K, OpRegion and Extended OpRegion
++ * [gpu_dsm_hpa, gpu_dsm_hpa+size] 64M, Date Stolen Memory
++ * for WHL/KBL GVT-d use:
++ * [0x7BFFC000, 0x7BFFE000) 8K, OpRegion, used by native GOP and gfx driver
++ * [0x7BFFE000, 0X7C000000] 8K, Extended OpRegion, store raw VBT
++ * [0x7C000000, 0x80000000] 64M, DSM, used by native GOP and gfx driver
++ * OpRegion: 8KB(0x2000)
++ * [ OpRegion Header      ] Offset: 0x0
++ * [ Mailbox #1: ACPI     ] Offset: 0x100
++ * [ Mailbox #2: SWSCI    ] Offset: 0x200
++ * [ Mailbox #3: ASLE     ] Offset: 0x300
++ * [ Mailbox #4: VBT      ] Offset: 0x400
++ * [ Mailbox #5: ASLE EXT ] Offset: 0x1C00
++ * Extended OpRegion: 8KB(0x2000)
++ * [ Raw VBT              ] Offset: 0x0
++ * If VBT <= 6KB, stores in Mailbox #4
++ * If VBT > 6KB, stores in Extended OpRegion
++ * ASLE.rvda stores the location of VBT.
++ * For OpRegion 2.1+: ASLE.rvda = offset to OpRegion base address
++ * For OpRegion 2.0:  ASLE.rvda = physical address, not support currently
++ */
++#define GPU_DSM_GPA                    0x7C00000
++#define GPU_DSM_SIZE                   0x4000000
++#define GPU_OPREGION_SIZE              0x4000
++/*
++ * TODO: Forced DSM/OPREGION size requires native BIOS configuration.
++ * This limitation need remove in future
++ */
++uint32_t get_gpu_rsvmem_base_gpa(void);
++uint32_t get_gpu_rsvmem_size(void);
++uint64_t get_software_sram_base_gpa(void);
++uint64_t get_software_sram_size(void);
++
+ typedef void (*pci_lintr_cb)(int b, int s, int pin, int pirq_pin,
+ 			     int ioapic_irq, void *arg);
+ 
+diff --git a/devicemodel/include/pcireg.h b/devicemodel/include/pcireg.h
+index a9c90f573..c15290319 100644
+--- a/devicemodel/include/pcireg.h
++++ b/devicemodel/include/pcireg.h
+@@ -1066,8 +1066,8 @@
+ #define	PCIM_OSC_CTL_PCIE_CAP_STRUCT	0x10 /* Various Capability Structures */
+ 
+ /* Graphics definitions */
+-#define INTEL_ELKHARTLAKE		0x4551
+-#define INTEL_TIGERLAKE		0x9a49
++#define INTEL_ELKHARTLAKE		0x4571
++#define INTEL_TIGERLAKE			0x9a49
+ #define PCIR_BDSM			0x5C /* BDSM graphics base data of stolen memory register */
+ #define PCIR_GEN11_BDSM_DW0		0xC0
+ #define PCIR_GEN11_BDSM_DW1		0xC4
+diff --git a/devicemodel/include/sw_load.h b/devicemodel/include/sw_load.h
+index f69d2e098..061914453 100644
+--- a/devicemodel/include/sw_load.h
++++ b/devicemodel/include/sw_load.h
+@@ -39,7 +39,7 @@
+ #define E820_TYPE_ACPI_NVS      4U   /* EFI 10 */
+ #define E820_TYPE_UNUSABLE      5U   /* EFI 8 */
+ 
+-#define NUM_E820_ENTRIES        9
++#define NUM_E820_ENTRIES        7
+ #define LOWRAM_E820_ENTRY       1
+ #define HIGHRAM_E820_ENTRY      6
+ 
+-- 
+2.25.1
+
